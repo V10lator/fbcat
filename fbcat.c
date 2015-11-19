@@ -168,9 +168,14 @@ static void dump_video_memory(
           }
           break;
       }
-      row[x * 3 + 0] = get_color(pixel, &info->red, colormap->red);
-      row[x * 3 + 1] = get_color(pixel, &info->green, colormap->green);
-      row[x * 3 + 2] = get_color(pixel, &info->blue, colormap->blue);
+	  
+	  /* V10lator: For some reason (only qualcomm might know) the pixels are f*cked up:
+	   * Transparent = Red,
+	   * Blue = Green,
+	   * Green = Blue */
+      row[x * 3 + 0] = get_color(pixel, &info->transp, colormap->red);
+      row[x * 3 + 1] = get_color(pixel, &info->blue, colormap->green);
+      row[x * 3 + 2] = get_color(pixel, &info->green, colormap->blue);
     }
     if (fwrite(row, 1, info->xres * 3, fp) != info->xres * 3)
       posix_error("write error");
