@@ -67,63 +67,6 @@ static inline unsigned char get_color(unsigned int pixel, const struct fb_bitfie
   return colormap[(pixel >> bitfield->offset) & ((1 << bitfield->length) - 1)] >> 8;
 }
 
-static inline unsigned char reverse_bits(unsigned char b)
-{
-  /* reverses the order of the bits in a byte
-   * from http://graphics.stanford.edu/~seander/bithacks.html#ReverseByteWith64BitsDiv
-   *
-   * how it works:
-   *
-   *   w = 0bABCDEFGH
-   *   x = w * 0x0202020202
-   *     = 0bABCDEFGHABCDEFGHABCDEFGHABCDEFGHABCDEFGH0
-   *   y = x & 0x010884422010
-   *     = 0bABCDEFGHABCDEFGHABCDEFGHABCDEFGHABCDEFGH0
-   *     & 0b10000100010000100010000100010000000010000
-   *     = 0bA0000F000B0000G000C0000H000D00000000E0000
-   *     = (A << 40) + (B << 31) + (C << 22) + (D << 13) + (E << 4) + (F << 35) + (G << 26) + (H << 17)
-   *   z = y % 1023 =
-   *     = (A << 0) + (B << 1) + (C << 2) + (D << 3) + (E << 4) + (F << 5) + (G << 6) + (H << 7)
-   *     = 0bHGFEDCBA
-   */
-  return (b * 0x0202020202ULL & 0x010884422010ULL) % 1023;
-}
-
-static void dump_video_memory_mono(
-  const unsigned char *video_memory,
-  const struct fb_var_screeninfo *info,
-  bool black_is_zero,
-  unsigned int line_length,
-  FILE *fp
-)
-{
-  unsigned int x, y;
-  const unsigned int bytes_per_row = (info->xres + 7) / 8;
-  unsigned char *row = malloc(bytes_per_row);
-  if (row == NULL)
-    posix_error("malloc failed");
-  assert(row != NULL);
-
-  if (info->xoffset % 8)
-    not_supported("xoffset not divisible by 8 in 1 bpp mode");
-  fprintf(fp, "P4 %" PRIu32 " %" PRIu32 "\n", info->xres, info->yres);
-  for (y = 0; y < info->yres; y++)
-  {
-    const unsigned char *current;
-    current = video_memory + (y + info->yoffset) * line_length + (info->xoffset / 8);
-    for (x = 0; x < bytes_per_row; x++)
-    {
-      row[x] = reverse_bits(*current++);
-      if (black_is_zero)
-        row[x] = ~row[x];
-    }
-    if (fwrite(row, 1, bytes_per_row, fp) != bytes_per_row)
-      posix_error("write error");
-  }
-
-  free(row);
-}
-
 static void dump_video_memory(
   const unsigned char *video_memory,
   const struct fb_var_screeninfo *info,
@@ -133,7 +76,6 @@ static void dump_video_memory(
 )
 {
   unsigned int x, y;
-  const unsigned int bytes_per_pixel = (info->bits_per_pixel + 7) / 8;
   unsigned char *row = malloc(info->xres * 3);
   if (row == NULL)
     posix_error("malloc failed");
@@ -143,31 +85,14 @@ static void dump_video_memory(
   for (y = 0; y < info->yres; y++)
   {
     const unsigned char *current;
-    current = video_memory + (y + info->yoffset) * line_length + info->xoffset * bytes_per_pixel;
+    current = video_memory + (y + info->yoffset) * line_length + info->xoffset * 4;
     for (x = 0; x < info->xres; x++)
     {
-      unsigned int i;
       unsigned int pixel = 0;
-      switch (bytes_per_pixel)
-      {
-        /* The following code assumes little-endian byte ordering in the frame
-         * buffer. */
-        case 4:
-          pixel = le32toh(*((uint32_t *) current));
-          current += 4;
-          break;
-        case 2:
-          pixel = le16toh(*((uint16_t *) current));
-          current += 2;
-          break;
-        default:
-          for (i = 0; i < bytes_per_pixel; i++)
-          {
-            pixel |= current[0] << (i * 8);
-            current++;
-          }
-          break;
-      }
+      /* The following code assumes little-endian byte ordering in the frame
+	   * buffer. */
+      pixel = le32toh(*((uint32_t *) current));
+      current += 4;
 	  
 	  /* V10lator: For some reason (only qualcomm might know) the pixels are f*cked up:
 	   * Transparent = Red,
@@ -219,8 +144,6 @@ int main(int argc, const char **argv)
   struct fb_fix_screeninfo fix_info;
   struct fb_var_screeninfo var_info;
   uint16_t colormap_data[4][1 << 8];
-  bool is_mono = false;
-  bool black_is_zero = false;
   struct fb_cmap colormap =
   {
     0,
@@ -243,49 +166,21 @@ int main(int argc, const char **argv)
   if (var_info.red.length > 8 || var_info.green.length > 8 || var_info.blue.length > 8)
     not_supported("color depth > 8 bits per component");
 
-  switch (fix_info.visual)
-  {
-    case FB_VISUAL_TRUECOLOR:
-    {
-      /* initialize dummy colormap */
-      unsigned int i;
-      for (i = 0; i < (1U << var_info.red.length); i++)
-        colormap.red[i] = i * 0xffff / ((1 << var_info.red.length) - 1);
-      for (i = 0; i < (1U << var_info.green.length); i++)
-        colormap.green[i] = i * 0xffff / ((1 << var_info.green.length) - 1);
-      for (i = 0; i < (1U << var_info.blue.length); i++)
-        colormap.blue[i] = i * 0xffff / ((1 << var_info.blue.length) - 1);
-      break;
-    }
-    case FB_VISUAL_DIRECTCOLOR:
-    case FB_VISUAL_PSEUDOCOLOR:
-    case FB_VISUAL_STATIC_PSEUDOCOLOR:
-      if (ioctl(fd, FBIOGETCMAP, &colormap) != 0)
-        posix_error("FBIOGETCMAP failed");
-      break;
-    case FB_VISUAL_MONO01:
-      is_mono = true;
-      break;
-    case FB_VISUAL_MONO10:
-      is_mono = true;
-      black_is_zero = true;
-      break;
-    default:
-      not_supported("unsupported visual");
-  }
+  unsigned int i;
+  for (i = 0; i < (1U << var_info.red.length); i++)
+    colormap.red[i] = i * 0xffff / ((1 << var_info.red.length) - 1);
+  for (i = 0; i < (1U << var_info.green.length); i++)
+    colormap.green[i] = i * 0xffff / ((1 << var_info.green.length) - 1);
+  for (i = 0; i < (1U << var_info.blue.length); i++)
+    colormap.blue[i] = i * 0xffff / ((1 << var_info.blue.length) - 1);
 
-  if (var_info.bits_per_pixel < 8 && !is_mono)
+  if (var_info.bits_per_pixel < 8)
     not_supported("< 8 bpp");
-  if (var_info.bits_per_pixel != 1 && is_mono)
-    not_supported("monochrome framebuffer is not 1 bbp");
   const size_t mapped_length = fix_info.line_length * (var_info.yres + var_info.yoffset);
   unsigned char *video_memory = mmap(NULL, mapped_length, PROT_READ, MAP_SHARED, fd, 0);
   if (video_memory == MAP_FAILED)
     posix_error("mmap failed");
-  if (is_mono)
-    dump_video_memory_mono(video_memory, &var_info, black_is_zero, fix_info.line_length, stdout);
-  else
-    dump_video_memory(video_memory, &var_info, &colormap, fix_info.line_length, stdout);
+  dump_video_memory(video_memory, &var_info, &colormap, fix_info.line_length, stdout);
 
   if (fclose(stdout))
     posix_error("write error");
